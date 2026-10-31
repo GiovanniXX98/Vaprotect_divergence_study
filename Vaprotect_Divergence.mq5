@@ -11,17 +11,18 @@
 
 input string InpSymbol2 = "GBPUSD";    // Asset Secondario
 input double InpLotSize = 0.05;        // Lottaggio (0.05 con leva 1:25)
-input int InpZScorePeriod = 50;        // Periodi per Z-Score Spread
+input int InpZScorePeriod = 23;        // Periodi per Z-Score Spread (ottimizzato)
 input double InpStopLossDev = 4.5;     // Z-Score Stop Loss strutturale
 input double InpMinCorrelation = 0.70; // Correlazione Minima mensile
 input double InpMinShortCorr = 0.50;   // Correlazione Minima breve periodo
-input int InpShortCorrBars = 24;       // Barre correlazione breve
-input int InpLookbackBars = 720;       // Finestra storica (H1=720 = 1 mese)
+input int InpShortCorrBars = 17;       // Barre correlazione breve (ottimizzato)
+input int InpLookbackBars = 1429;      // Finestra storica picco Z (ottimizzato)
 input double InpPeakZMultiplier =
-    0.2; // % del picco Z per banda ingresso (0.45 ottimale)
-input double InpBandMin = 1.5;  // Banda ingresso minima assoluta
-input int InpSlopeWindow = 10;  // Finestra slope (barre)
-input int InpSlopeMinHours = 3; // Ore minime aperto prima di uscire su slope
+    0.23; // % del picco Z per banda ingresso (ottimizzato)
+input double InpBandMin = 2.54; // Banda ingresso minima assoluta (ottimizzato)
+input int InpMaFast = 17;       // Periodi Media Mobile Veloce su Spread (ottimizzato)
+input int InpMaMed = 45;        // Periodi Media Mobile Intermedia su Spread (ottimizzato)
+input int InpMaSlow = 111;      // Periodi Media Mobile Lenta su Spread (ottimizzato)
 input double InpMaxLossMoney = 50.0; // Hard Stop Loss monetario (€)
 input int InpCooldownHours = 4;      // Ore pausa dopo chiusura
 input int InpCorrPersistHours = 72; // Ore min correlazione bassa per Cigno Nero
@@ -33,8 +34,6 @@ bool first_tick = true;
 datetime cooldown_until = 0;
 datetime corr_low_since = 0;     // Timestamp da quando corr24 è sotto soglia
 datetime position_open_time = 0; // Timestamp apertura posizione corrente
-double slope_sign_at_entry =
-    0.0; // Segno slope al momento dell'entrata (+1 o -1)
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -98,9 +97,8 @@ double CalculateCorrelation(const double &arr1[], const double &arr2[],
 //+------------------------------------------------------------------+
 void OnTick() {
   // 1. Calcolo Z-Score dinamico (Spread % normalizzato)
-  int calc_period = InpZScorePeriod;
-  int total_bars_needed =
-      calc_period * 2; // Servono (N + N) candele per calcolare N medie mobili
+  int calc_period = MathMax(InpZScorePeriod, InpMaSlow);
+  int total_bars_needed = calc_period * 2;
 
   double close1[], close2[];
   ArraySetAsSeries(close1, true);
@@ -140,16 +138,20 @@ void OnTick() {
     sum_spread += spread_array[i];
   }
 
-  // Calcolo spread medio a 50 periodi
-  double mean_spread = sum_spread / calc_period;
+  // Calcolo spread medio (su InpZScorePeriod)
+  double sum_z_spread = 0.0;
+  for (int i = 0; i < InpZScorePeriod; i++) {
+    sum_z_spread += spread_array[i];
+  }
+  double mean_spread = sum_z_spread / InpZScorePeriod;
 
   double sum_sq_diff = 0.0;
-  for (int i = 0; i < calc_period; i++) {
+  for (int i = 0; i < InpZScorePeriod; i++) {
     sum_sq_diff += MathPow(spread_array[i] - mean_spread, 2.0);
   }
 
-  // Calcolo deviazione standard a 50 periodi
-  double std_dev = MathSqrt(sum_sq_diff / calc_period);
+  // Calcolo deviazione standard (su InpZScorePeriod)
+  double std_dev = MathSqrt(sum_sq_diff / InpZScorePeriod);
 
   double current_price1 = SymbolInfoDouble(_Symbol, SYMBOL_BID);
   double current_price2 = SymbolInfoDouble(InpSymbol2, SYMBOL_BID);
@@ -169,26 +171,20 @@ void OnTick() {
   if (TimeCurrent() < cooldown_until)
     return;
 
-  // 1.5 Calcolo Slope e Banda Dinamica (usate sia in uscita che in ingresso)
-  double current_slope = 0.0;
+  // 1.5 Calcolo Medie Mobili dello Spread e Banda Dinamica
+  double ma_fast = 0.0, ma_med = 0.0, ma_slow = 0.0;
+  for (int k = 0; k < InpMaFast; k++) ma_fast += spread_array[k];
+  ma_fast /= InpMaFast;
+  for (int k = 0; k < InpMaMed; k++) ma_med += spread_array[k];
+  ma_med /= InpMaMed;
+  for (int k = 0; k < InpMaSlow; k++) ma_slow += spread_array[k];
+  ma_slow /= InpMaSlow;
+
   double peak_z = 2.0; // fallback se non ci sono dati storici
   {
-    // Slope: derivata della media mobile dello spread % su InpSlopeWindow barre
-    if (calc_period >= InpSlopeWindow + 3) {
-      double ma_now = 0.0, ma_prev = 0.0;
-      // calcolo spread ora e 3 ore fa media  10 periodi
-      for (int k = 0; k < InpSlopeWindow; k++)
-        ma_now += spread_array[k];
-      for (int k = 3; k < InpSlopeWindow + 3; k++)
-        ma_prev += spread_array[k];
-      ma_now /= InpSlopeWindow;
-      ma_prev /= InpSlopeWindow;
-      current_slope = ma_now - ma_prev; // >0 spread % sale, <0 spread % scende
-    }
-
     // Peak Z: massimo Z-Score assoluto negli ultimi InpLookbackBars periodi
     // (Spread % normalizzato)
-    int peak_bars_needed = InpLookbackBars + calc_period;
+    int peak_bars_needed = InpLookbackBars + InpZScorePeriod;
     double hist1[], hist2[];
     ArraySetAsSeries(hist1, true);
     ArraySetAsSeries(hist2, true);
@@ -203,12 +199,12 @@ void OnTick() {
       for (int i = 0; i < InpLookbackBars; i++) {
         // Calcola Media Mobile a 50 periodi per la candela 'i' storica
         double sum1 = 0.0, sum2 = 0.0;
-        for (int j = 0; j < calc_period; j++) {
+        for (int j = 0; j < InpZScorePeriod; j++) {
           sum1 += hist1[i + j];
           sum2 += hist2[i + j];
         }
-        double ma1 = sum1 / calc_period;
-        double ma2 = sum2 / calc_period;
+        double ma1 = sum1 / InpZScorePeriod;
+        double ma2 = sum2 / InpZScorePeriod;
 
         double dev1 = 0.0, dev2 = 0.0;
         if (ma1 > 0.000001)
@@ -377,36 +373,7 @@ void OnTick() {
       }
     }
 
-    // === USCITA 2: SLOPE INVERTITA — la mean reversion ha perso slancio ===
-    if (!close_all && slope_sign_at_entry != 0.0 && position_open_time > 0) {
-      double current_slope_sign =
-          (current_slope > 0.0)
-              ? 1.0
-              : ((current_slope < 0.0) ? -1.0 : slope_sign_at_entry);
-      int hours_open = (int)((TimeCurrent() - position_open_time) / 3600);
-      bool slope_reversed = (current_slope_sign != slope_sign_at_entry);
-
-      if (slope_reversed && hours_open >= InpSlopeMinHours) {
-        if (total_net_profit > 0.0) {
-          close_all = true;
-          Print("[SLOPE_REV] Slope invertita dopo ", hours_open,
-                "h. Chiusura in PROFITTO: +", total_net_profit);
-        }
-        // non mi piace
-        else if (total_net_profit > -10.0) {
-          close_all = true;
-          Print("[SLOPE_REV] Slope invertita dopo ", hours_open,
-                "h. Perdita contenuta: ", total_net_profit,
-                ". Chiusura preventiva.");
-        } else
-          Print("[SLOPE_WATCH] Slope invertita dopo ", hours_open,
-                "h ma perdita troppo alta (", total_net_profit,
-                "). Attendo recupero.");
-      }
-    }
-
     if (close_all) {
-      slope_sign_at_entry = 0.0;
       position_open_time = 0;
       for (int i = PositionsTotal() - 1; i >= 0; i--) {
         ulong ticket = PositionGetTicket(i);
@@ -416,8 +383,7 @@ void OnTick() {
       }
     }
   }
-  // 4. Logica di Ingresso con FILTRO SLOPE (solo se non abbiamo posizioni
-  // aperte)
+  // 4. Logica di Ingresso con MEDIE MOBILI SULLO SPREAD (solo se non abbiamo posizioni aperte)
   if (!has_our_positions) {
     // Banda dinamica: % del picco Z storico
     double entry_band = peak_z * InpPeakZMultiplier;
@@ -426,30 +392,12 @@ void OnTick() {
 
     // CONDIZIONE DI ATTIVAZIONE:
     // Z-Score è OLTRE la banda (non solo nel tick di incrocio)
-    // E la slope CONFERMA che il movimento di ritorno è già iniziato
-    // Guard: last_zscore deve essere < entry_band (evita re-entrata continua)
     bool in_zone_high = (current_zscore > entry_band);
     bool in_zone_low = (current_zscore < -entry_band);
 
-    // Filtro guard: non rientrare se eravamo già oltre la banda (già dentro la
-    // zona)
-    bool fresh_entry_high =
-        (last_zscore <= entry_band); // eravamo sotto, ora sopra
-    bool fresh_entry_low =
-        (last_zscore >= -entry_band); // eravamo sopra, ora sotto
-
-    // SLOPE conferma: lo spread si sta già girando verso la media
-    bool trigger_short =
-        in_zone_high && fresh_entry_high && (current_slope < 0.0);
-    bool trigger_long = in_zone_low && fresh_entry_low && (current_slope > 0.0);
-
-    // Modalità ZONA ESTESA: se Z > entry_band*1.3 e slope concorde, entra anche
-    // senza fresh
-    double extended_band = entry_band * 1.3;
-    if (!trigger_short && current_zscore > extended_band && current_slope < 0.0)
-      trigger_short = true;
-    if (!trigger_long && current_zscore < -extended_band && current_slope > 0.0)
-      trigger_long = true;
+    // MEDIE MOBILI conferma
+    bool trigger_short = in_zone_high && (ma_fast < ma_med && ma_med < ma_slow);
+    bool trigger_long = in_zone_low && (ma_fast > ma_med && ma_med > ma_slow);
 
     if (trigger_short || trigger_long) {
       // FILTRO CORRELAZIONE
@@ -512,13 +460,13 @@ void OnTick() {
                 trade.PositionClose(_Symbol);
                 cooldown_until = TimeCurrent() + InpCooldownHours * 3600;
               } else {
-                slope_sign_at_entry =
-                    -1.0; // SELL spread: slope doveva essere <0
                 position_open_time = TimeCurrent();
-                Print("[SLOPE+BAND] SELL ", _Symbol, " / BUY ", InpSymbol2,
+                Print("[3MA+BAND] SELL ", _Symbol, " / BUY ", InpSymbol2,
                       " | Z=", NormalizeDouble(current_zscore, 3),
                       " | Band=", NormalizeDouble(entry_band, 3),
-                      " | Slope=", NormalizeDouble(current_slope, 6));
+                      " | F=", NormalizeDouble(ma_fast, 4),
+                      " | M=", NormalizeDouble(ma_med, 4),
+                      " | S=", NormalizeDouble(ma_slow, 4));
               }
             }
           } else if (trigger_long) {
@@ -533,12 +481,13 @@ void OnTick() {
                 trade.PositionClose(_Symbol);
                 cooldown_until = TimeCurrent() + InpCooldownHours * 3600;
               } else {
-                slope_sign_at_entry = 1.0; // BUY spread: slope doveva essere >0
                 position_open_time = TimeCurrent();
-                Print("[SLOPE+BAND] BUY ", _Symbol, " / SELL ", InpSymbol2,
+                Print("[3MA+BAND] BUY ", _Symbol, " / SELL ", InpSymbol2,
                       " | Z=", NormalizeDouble(current_zscore, 3),
                       " | Band=", NormalizeDouble(entry_band, 3),
-                      " | Slope=", NormalizeDouble(current_slope, 6));
+                      " | F=", NormalizeDouble(ma_fast, 4),
+                      " | M=", NormalizeDouble(ma_med, 4),
+                      " | S=", NormalizeDouble(ma_slow, 4));
               }
             }
           }

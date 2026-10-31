@@ -1,3 +1,5 @@
 /optimizer
 /Vaprotect_Divergence.mq5
 /Vaprotect_Final.mq5
+*.log
+*.utf8
